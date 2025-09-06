@@ -1,5 +1,4 @@
-requests
-ttkthemes
-PyQt6
-mariadb
-customtkinter
+customtkinter>=5.0.0
+requests>=2.25.0
+pymongo>=4.0.0
+mariadb>=1.1.0

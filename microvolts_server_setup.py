@@ -79,9 +79,23 @@ def worker_install_llvm(q, config):
     except Exception as e:
         worker_log(q, f"LLVM installation failed: {e}")
         if worker_ask_yes_no(q, "LLVM Installation Failed", "LLVM installation failed. Continue anyway?"):
-             q.put({'type': 'result', 'success': True})
+              q.put({'type': 'result', 'success': True})
         else:
-             q.put({'type': 'result', 'success': False})
+              q.put({'type': 'result', 'success': False})
+
+def worker_install_llvm_crossplatform(q, config):
+    """Cross-platform LLVM installation"""
+    import platform
+    system = platform.system().lower()
+
+    if system == "windows":
+        return worker_install_llvm(q, config)
+    else:
+        worker_log(q, f"LLVM installation not implemented for {system}. Please install LLVM manually.")
+        if worker_ask_yes_no(q, "Manual Installation Required", f"Please install LLVM for {system} and continue."):
+            q.put({'type': 'result', 'success': True})
+        else:
+            q.put({'type': 'result', 'success': False})
 
 def worker_download_repository(q, config):
     try:
@@ -164,7 +178,14 @@ def worker_setup_vcpkg(q, config):
         q.put({'type': 'result', 'success': False})
 
 def worker_delete_service(q, service_name):
-    """Attempts to delete a Windows service."""
+    """Attempts to delete a service (Windows) or skip on other platforms."""
+    import platform
+    system = platform.system().lower()
+
+    if system != "windows":
+        worker_log(q, f"Service deletion not supported on {system}. Skipping.")
+        return True
+
     try:
         worker_log(q, f"Attempting to delete service: {service_name}")
         # Use sc.exe to delete the service. This is a standard Windows command.
@@ -187,6 +208,17 @@ def worker_delete_service(q, service_name):
         # The installer will likely fail with a more specific error if this was the root cause.
         return True
 def worker_install_mariadb(q, config):
+    import platform
+    system = platform.system().lower()
+
+    if system != "windows":
+        worker_log(q, f"MariaDB MSI installation not supported on {system}. Please install MariaDB manually.")
+        if worker_ask_yes_no(q, "Manual Installation Required", f"Please install MariaDB for {system} and continue."):
+            q.put({'type': 'result', 'success': True})
+        else:
+            q.put({'type': 'result', 'success': False})
+        return
+
     try:
         if config['existing_mariadb']:
             worker_log(q, "Skipping MariaDB installation as per user's choice.")
@@ -206,11 +238,13 @@ def worker_install_mariadb(q, config):
             script_dir = os.getcwd()
 
         installer_path = os.path.join(script_dir, installer_name)
+        worker_log(q, f"Expected MariaDB installer path: {installer_path}")
+        worker_log(q, f"Script directory: {script_dir}")
 
         if not os.path.exists(installer_path):
             worker_log(q, f"MariaDB installer not found at '{installer_path}'. Attempting to download...")
             mariadb_url = f"https://archive.mariadb.org/mariadb-{mariadb_version}/winx64-packages/{installer_name}"
-            
+
             try:
                 response = requests.get(mariadb_url, stream=True)
                 response.raise_for_status()
@@ -309,24 +343,67 @@ def worker_setup_database(q, config):
                     mysql_exe = path
                     worker_log(q, f"Found MariaDB at: {mysql_exe}")
                     break
-        
+
         if not mysql_exe:
             raise Exception("Could not find mysql.exe. Please specify the path in the DB Config tab if you have an existing installation.")
 
-        # Create the database first
-        worker_log(q, f"Ensuring database '{config['db_name']}' exists...")
+        # Test database connection first
+        worker_log(q, "Testing database connection...")
+        test_cmd = [
+            mysql_exe, "-u", config['db_username'], f"-p{config['db_password']}",
+            "-h", config['db_ip'], f"-P", str(config['db_port']),
+            "-e", "SELECT 1;"
+        ]
+        result = subprocess.run(test_cmd, capture_output=True, text=True, check=False)
+        if result.returncode != 0:
+            raise Exception(f"Database connection failed: {result.stderr}")
+
+        worker_log(q, "Database connection successful.")
+
+        # Find an available database name
+        original_db_name = config['db_name']
+        db_name = original_db_name
+        counter = 1
+
+        while True:
+            worker_log(q, f"Checking if database '{db_name}' already exists...")
+            check_db_cmd = [
+                mysql_exe, "-u", config['db_username'], f"-p{config['db_password']}",
+                "-h", config['db_ip'], f"-P", str(config['db_port']),
+                "-e", f"SHOW DATABASES LIKE '{db_name}';"
+            ]
+            result = subprocess.run(check_db_cmd, capture_output=True, text=True, check=False)
+            if result.returncode != 0:
+                raise Exception(f"Failed to check database existence: {result.stderr}")
+
+            db_exists = db_name in result.stdout
+
+            if not db_exists:
+                break  # Found an available name
+            else:
+                counter += 1
+                db_name = f"{original_db_name}-{counter}"
+                worker_log(q, f"Database '{db_name}' already exists, trying '{db_name}'...")
+
+        if db_name != original_db_name:
+            worker_log(q, f"Using database name '{db_name}' (original '{original_db_name}' was taken)")
+            config['db_name'] = db_name  # Update config with new name
+
+        # Create the database
+        worker_log(q, f"Creating database '{config['db_name']}'...")
         create_db_cmd = [
             mysql_exe, "-u", config['db_username'], f"-p{config['db_password']}",
             "-h", config['db_ip'], f"-P", str(config['db_port']),
-            "-e", f"CREATE DATABASE IF NOT EXISTS `{config['db_name']}`;"
+            "-e", f"CREATE DATABASE `{config['db_name']}` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;"
         ]
         result = subprocess.run(create_db_cmd, capture_output=True, text=True, check=False)
         if result.returncode != 0:
             raise Exception(f"Failed to create database: {result.stderr}")
-        worker_log(q, f"Database '{config['db_name']}' created or already exists.")
+        worker_log(q, f"Database '{config['db_name']}' created successfully.")
 
         # Now import the script
-        with open(sql_script_path, 'r') as f:
+        worker_log(q, "Importing database schema...")
+        with open(sql_script_path, 'r', encoding='utf-8') as f:
             sql_script_content = f.read()
 
         import_cmd = [
@@ -340,6 +417,7 @@ def worker_setup_database(q, config):
             raise Exception(f"Database script execution failed: {result.stderr}")
 
         worker_log(q, "Database setup complete.")
+        worker_log(q, f"Successfully set up MicroVolts database '{config['db_name']}' without affecting other databases.")
         q.put({'type': 'result', 'success': True})
     except Exception as e:
         worker_log(q, f"Failed to set up database: {e}")
@@ -349,11 +427,14 @@ class MicroVoltsServerSetup(customtkinter.CTk):
     def __init__(self):
         super().__init__()
         self.title("MicroVolts Server Setup v3.0 | @Mikael")
-        self.geometry("1100x850")
+        self.geometry("1200x900")
         self.resizable(True, True)
+        self.minsize(1000, 700)
 
-        self.title_font = customtkinter.CTkFont(family="Segoe UI", size=20, weight="bold")
-        self.header_font = customtkinter.CTkFont(family="Segoe UI", size=13, weight="bold")
+        # Configure fonts
+        self.title_font = customtkinter.CTkFont(family="Segoe UI", size=22, weight="bold")
+        self.header_font = customtkinter.CTkFont(family="Segoe UI", size=14, weight="bold")
+        self.body_font = customtkinter.CTkFont(family="Segoe UI", size=11)
 
         self.project_path = tk.StringVar()
         self.local_ip = tk.StringVar()
@@ -397,8 +478,18 @@ class MicroVoltsServerSetup(customtkinter.CTk):
         
     def center_window(self):
         self.update_idletasks()
-        x = (self.winfo_screenwidth() // 2) - (self.winfo_width() // 2)
-        y = (self.winfo_screenheight() // 2) - (self.winfo_height() // 2)
+        screen_width = self.winfo_screenwidth()
+        screen_height = self.winfo_screenheight()
+        window_width = self.winfo_width()
+        window_height = self.winfo_height()
+
+        x = (screen_width // 2) - (window_width // 2)
+        y = (screen_height // 2) - (window_height // 2)
+
+        # Ensure window doesn't go off screen
+        x = max(0, min(x, screen_width - window_width))
+        y = max(0, min(y, screen_height - window_height))
+
         self.geometry(f"+{x}+{y}")
 
     def browse_directory(self):
@@ -487,34 +578,79 @@ class MicroVoltsServerSetup(customtkinter.CTk):
             messagebox.showerror("Error", f"Could not save settings to {self.config_file}.\n{e}")
         
     def setup_gui(self):
+        # Configure main window
         self.grid_columnconfigure(0, weight=1)
         self.grid_rowconfigure(1, weight=1)
 
+        # Header with improved styling
         header_frame = customtkinter.CTkFrame(self, fg_color="transparent")
-        header_frame.grid(row=0, column=0, sticky="ew", padx=20, pady=20)
-        
-        title_label = customtkinter.CTkLabel(header_frame, text="MicroVolts Server Setup", font=self.title_font)
+        header_frame.grid(row=0, column=0, sticky="ew", padx=25, pady=(25, 15))
+
+        title_label = customtkinter.CTkLabel(
+            header_frame,
+            text="MicroVolts Server Setup",
+            font=self.title_font
+        )
         title_label.pack(side="left")
 
+        version_label = customtkinter.CTkLabel(
+            header_frame,
+            text="v3.0",
+            font=customtkinter.CTkFont(size=12, weight="normal"),
+            text_color="gray70"
+        )
+        version_label.pack(side="right", padx=(10, 0))
+
+        # Main content frame
         main_frame = customtkinter.CTkFrame(self, fg_color="transparent")
-        main_frame.grid(row=1, column=0, sticky="nsew", padx=20, pady=(0, 20))
+        main_frame.grid(row=1, column=0, sticky="nsew", padx=25, pady=(0, 25))
         main_frame.grid_columnconfigure(0, weight=1)
         main_frame.grid_rowconfigure(1, weight=1)
 
-        path_frame = customtkinter.CTkFrame(main_frame)
-        path_frame.grid(row=0, column=0, sticky="ew", pady=(0, 10))
+        # Project path section with better styling
+        path_frame = customtkinter.CTkFrame(main_frame, fg_color="transparent")
+        path_frame.grid(row=0, column=0, sticky="ew", pady=(0, 15))
         path_frame.grid_columnconfigure(0, weight=1)
-        
-        customtkinter.CTkEntry(path_frame, textvariable=self.project_path).grid(row=0, column=0, sticky="ew", pady=5, padx=5)
-        customtkinter.CTkButton(path_frame, text="Browse...", command=self.browse_directory, width=100).grid(row=0, column=1, pady=5, padx=5)
 
-        self.notebook = customtkinter.CTkTabview(main_frame)
+        path_label = customtkinter.CTkLabel(
+            path_frame,
+            text="Project Directory:",
+            font=self.header_font
+        )
+        path_label.grid(row=0, column=0, sticky="w", pady=(0, 5))
+
+        entry_frame = customtkinter.CTkFrame(path_frame)
+        entry_frame.grid(row=1, column=0, sticky="ew")
+        entry_frame.grid_columnconfigure(0, weight=1)
+
+        customtkinter.CTkEntry(
+            entry_frame,
+            textvariable=self.project_path,
+            placeholder_text="Select installation directory..."
+        ).grid(row=0, column=0, sticky="ew", pady=8, padx=8)
+
+        customtkinter.CTkButton(
+            entry_frame,
+            text="Browse...",
+            command=self.browse_directory,
+            width=120,
+            height=35
+        ).grid(row=0, column=1, pady=8, padx=(0, 8))
+
+        # Tabview with improved styling
+        self.notebook = customtkinter.CTkTabview(
+            main_frame,
+            width=800,
+            height=500
+        )
         self.notebook.grid(row=1, column=0, sticky="nsew")
-        
+
         tab_names = ["Setup Progress", "Server Config", "DB Config", "Multi-Server", "Server Console", "Tools & Updates"]
         for name in tab_names:
             self.notebook.add(name)
-            self.notebook.tab(name).grid_columnconfigure(0, weight=1)
+            tab = self.notebook.tab(name)
+            tab.grid_columnconfigure(0, weight=1)
+            tab.grid_rowconfigure(0, weight=1)
 
         self.setup_progress_tab(self.notebook.tab("Setup Progress"))
         self.setup_server_config_tab(self.notebook.tab("Server Config"))
@@ -523,105 +659,480 @@ class MicroVoltsServerSetup(customtkinter.CTk):
         self.setup_console_tab(self.notebook.tab("Server Console"))
         self.setup_tools_tab(self.notebook.tab("Tools & Updates"))
 
+        # Bottom button frame with improved layout
         button_frame = customtkinter.CTkFrame(self, fg_color="transparent")
-        button_frame.grid(row=2, column=0, sticky="ew", padx=20, pady=10)
-        button_frame.grid_columnconfigure(0, weight=1)
-        
-        self.start_button = customtkinter.CTkButton(button_frame, text="Start Setup", command=self.start_setup)
-        self.start_button.pack(side="left", padx=5)
-        
-        self.stop_button = customtkinter.CTkButton(button_frame, text="Stop Setup", command=self.stop_setup, state=tk.DISABLED, fg_color="#D32F2F", hover_color="#B71C1C")
-        self.stop_button.pack(side="left", padx=5)
-        
-        customtkinter.CTkButton(button_frame, text="Exit", command=self.on_closing, fg_color="transparent", border_width=1).pack(side="right", padx=5)
+        button_frame.grid(row=2, column=0, sticky="ew", padx=25, pady=(0, 20))
+
+        # Left side buttons
+        left_frame = customtkinter.CTkFrame(button_frame, fg_color="transparent")
+        left_frame.pack(side="left")
+
+        self.start_button = customtkinter.CTkButton(
+            left_frame,
+            text="Start Setup",
+            command=self.start_setup,
+            height=40,
+            width=120
+        )
+        self.start_button.pack(side="left", padx=(0, 10))
+
+        self.stop_button = customtkinter.CTkButton(
+            left_frame,
+            text="Stop Setup",
+            command=self.stop_setup,
+            state=tk.DISABLED,
+            fg_color="#D32F2F",
+            hover_color="#B71C1C",
+            height=40,
+            width=120
+        )
+        self.stop_button.pack(side="left")
+
+        # Right side buttons
+        right_frame = customtkinter.CTkFrame(button_frame, fg_color="transparent")
+        right_frame.pack(side="right")
+
+        customtkinter.CTkButton(
+            right_frame,
+            text="Exit",
+            command=self.on_closing,
+            fg_color="transparent",
+            border_width=1,
+            height=40,
+            width=80
+        ).pack(side="right")
 
     def setup_server_config_tab(self, tab):
-        tab.grid_columnconfigure(1, weight=1)
-        ip_frame = customtkinter.CTkFrame(tab)
-        ip_frame.grid(row=0, column=0, columnspan=2, sticky="ew", padx=10, pady=10)
+        tab.grid_columnconfigure(0, weight=1)
+        tab.grid_rowconfigure(0, weight=1)
+
+        # Main container
+        main_container = customtkinter.CTkFrame(tab, fg_color="transparent")
+        main_container.grid(row=0, column=0, sticky="nsew", padx=15, pady=15)
+        main_container.grid_columnconfigure(0, weight=1)
+
+        # Header
+        header_label = customtkinter.CTkLabel(
+            main_container,
+            text="Server Configuration",
+            font=self.header_font
+        )
+        header_label.grid(row=0, column=0, sticky="w", pady=(0, 15))
+
+        # IP Configuration frame
+        ip_frame = customtkinter.CTkFrame(main_container)
+        ip_frame.grid(row=1, column=0, sticky="ew", pady=(0, 10))
         ip_frame.grid_columnconfigure(1, weight=1)
-        customtkinter.CTkLabel(ip_frame, text="Local IP:").grid(row=0, column=0, sticky=tk.W, pady=2, padx=10)
-        customtkinter.CTkEntry(ip_frame, textvariable=self.local_ip).grid(row=0, column=1, sticky="ew", pady=2, padx=5)
-        customtkinter.CTkButton(ip_frame, text="Auto-detect", command=self.auto_detect_ip, width=120).grid(row=0, column=2, padx=10, pady=2)
+
+        ip_title = customtkinter.CTkLabel(
+            ip_frame,
+            text="Network Settings",
+            font=customtkinter.CTkFont(size=12, weight="bold")
+        )
+        ip_title.grid(row=0, column=0, columnspan=3, sticky="w", padx=15, pady=(10, 5))
+
+        # Local IP row
+        customtkinter.CTkLabel(ip_frame, text="Local IP:").grid(row=1, column=0, sticky="w", pady=8, padx=15)
+        customtkinter.CTkEntry(
+            ip_frame,
+            textvariable=self.local_ip,
+            placeholder_text="e.g., 192.168.1.100"
+        ).grid(row=1, column=1, sticky="ew", pady=8, padx=5)
+        customtkinter.CTkButton(
+            ip_frame,
+            text="Auto-detect",
+            command=self.auto_detect_ip,
+            width=100
+        ).grid(row=1, column=2, padx=15, pady=8)
+
+        # Info text
+        info_frame = customtkinter.CTkFrame(main_container, fg_color="transparent")
+        info_frame.grid(row=2, column=0, sticky="ew", pady=(10, 0))
+
+        info_text = customtkinter.CTkLabel(
+            info_frame,
+            text="💡 Tip: Use auto-detect to find your local IP address, or enter it manually if you have a specific configuration.",
+            font=customtkinter.CTkFont(size=10),
+            text_color="gray70",
+            wraplength=600
+        )
+        info_text.pack(pady=5, padx=5)
 
     def setup_db_config_tab(self, tab):
         tab.grid_columnconfigure(0, weight=1)
-        self.db_install_frame = customtkinter.CTkFrame(tab, fg_color="transparent")
-        self.db_install_frame.grid(row=0, column=0, sticky="nsew", padx=10, pady=10)
+        tab.grid_rowconfigure(0, weight=1)
+
+        # Main container
+        main_container = customtkinter.CTkFrame(tab, fg_color="transparent")
+        main_container.grid(row=0, column=0, sticky="nsew", padx=15, pady=15)
+        main_container.grid_columnconfigure(0, weight=1)
+
+        # Header
+        header_label = customtkinter.CTkLabel(
+            main_container,
+            text="Database Configuration",
+            font=self.header_font
+        )
+        header_label.grid(row=0, column=0, sticky="w", pady=(0, 15))
+
+        # Database settings frame
+        self.db_install_frame = customtkinter.CTkFrame(main_container)
+        self.db_install_frame.grid(row=1, column=0, sticky="ew", pady=(0, 15))
         self.db_install_frame.grid_columnconfigure(1, weight=1)
+        self.db_install_frame.grid_columnconfigure(3, weight=1)
 
-        db_frame = customtkinter.CTkFrame(self.db_install_frame)
-        db_frame.grid(row=0, column=0, columnspan=4, sticky="ew")
-        db_frame.grid_columnconfigure(1, weight=1)
-        db_frame.grid_columnconfigure(3, weight=1)
+        db_title = customtkinter.CTkLabel(
+            self.db_install_frame,
+            text="Connection Settings",
+            font=customtkinter.CTkFont(size=12, weight="bold")
+        )
+        db_title.grid(row=0, column=0, columnspan=4, sticky="w", padx=15, pady=(10, 8))
 
-        customtkinter.CTkLabel(db_frame, text="DB IP:").grid(row=0, column=0, sticky=tk.W, pady=5, padx=10)
-        customtkinter.CTkEntry(db_frame, textvariable=self.db_ip).grid(row=0, column=1, sticky="ew", pady=5, padx=5)
-        customtkinter.CTkLabel(db_frame, text="DB Port:").grid(row=0, column=2, sticky=tk.W, pady=5, padx=10)
-        customtkinter.CTkEntry(db_frame, textvariable=self.db_port).grid(row=0, column=3, sticky="ew", pady=5, padx=5)
-        customtkinter.CTkLabel(db_frame, text="Username:").grid(row=1, column=0, sticky=tk.W, pady=5, padx=10)
-        customtkinter.CTkEntry(db_frame, textvariable=self.db_username).grid(row=1, column=1, sticky="ew", pady=5, padx=5)
-        customtkinter.CTkLabel(db_frame, text="DB Name:").grid(row=1, column=2, sticky=tk.W, pady=5, padx=10)
-        customtkinter.CTkEntry(db_frame, textvariable=self.db_name).grid(row=1, column=3, sticky="ew", pady=5, padx=5)
-        customtkinter.CTkLabel(db_frame, text="Password:").grid(row=2, column=0, sticky=tk.W, pady=5, padx=10)
-        self.password_entry = customtkinter.CTkEntry(db_frame, textvariable=self.db_password, show="*")
-        self.password_entry.grid(row=2, column=1, columnspan=2, sticky="ew", pady=5, padx=5)
-        customtkinter.CTkButton(db_frame, text="Generate", command=self.generate_random_password, width=100).grid(row=2, column=3, padx=5, pady=5)
+        # First row: IP and Port
+        customtkinter.CTkLabel(self.db_install_frame, text="Database IP:").grid(row=1, column=0, sticky="w", pady=6, padx=15)
+        customtkinter.CTkEntry(
+            self.db_install_frame,
+            textvariable=self.db_ip,
+            placeholder_text="e.g., 127.0.0.1"
+        ).grid(row=1, column=1, sticky="ew", pady=6, padx=5)
 
-        customtkinter.CTkCheckBox(tab, text="Use existing MariaDB installation", variable=self.existing_mariadb, command=self.toggle_mariadb_fields).grid(row=1, column=0, sticky=tk.W, pady=10, padx=10)
+        customtkinter.CTkLabel(self.db_install_frame, text="Port:").grid(row=1, column=2, sticky="w", pady=6, padx=15)
+        customtkinter.CTkEntry(
+            self.db_install_frame,
+            textvariable=self.db_port,
+            placeholder_text="3306"
+        ).grid(row=1, column=3, sticky="ew", pady=6, padx=5)
 
-        self.existing_db_frame = customtkinter.CTkFrame(tab)
+        # Second row: Username and DB Name
+        customtkinter.CTkLabel(self.db_install_frame, text="Username:").grid(row=2, column=0, sticky="w", pady=6, padx=15)
+        customtkinter.CTkEntry(
+            self.db_install_frame,
+            textvariable=self.db_username,
+            placeholder_text="root"
+        ).grid(row=2, column=1, sticky="ew", pady=6, padx=5)
+
+        customtkinter.CTkLabel(self.db_install_frame, text="Database Name:").grid(row=2, column=2, sticky="w", pady=6, padx=15)
+        customtkinter.CTkEntry(
+            self.db_install_frame,
+            textvariable=self.db_name,
+            placeholder_text="microvolts-db"
+        ).grid(row=2, column=3, sticky="ew", pady=6, padx=5)
+
+        # Third row: Password
+        customtkinter.CTkLabel(self.db_install_frame, text="Password:").grid(row=3, column=0, sticky="w", pady=6, padx=15)
+        self.password_entry = customtkinter.CTkEntry(
+            self.db_install_frame,
+            textvariable=self.db_password,
+            show="*",
+            placeholder_text="Enter database password"
+        )
+        self.password_entry.grid(row=3, column=1, columnspan=2, sticky="ew", pady=6, padx=5)
+        customtkinter.CTkButton(
+            self.db_install_frame,
+            text="Generate",
+            command=self.generate_random_password,
+            width=100
+        ).grid(row=3, column=3, padx=5, pady=6)
+
+        # Existing MariaDB checkbox
+        checkbox_frame = customtkinter.CTkFrame(main_container, fg_color="transparent")
+        checkbox_frame.grid(row=2, column=0, sticky="ew", pady=(0, 10))
+
+        checkbox_container = customtkinter.CTkFrame(checkbox_frame, fg_color="transparent")
+        checkbox_container.pack(fill="x", padx=5, pady=5)
+
+        customtkinter.CTkCheckBox(
+            checkbox_container,
+            text="Use existing MariaDB installation",
+            variable=self.existing_mariadb,
+            command=self.toggle_mariadb_fields
+        ).pack(side="left")
+
+        # Info icon with tooltip
+        info_label = customtkinter.CTkLabel(
+            checkbox_container,
+            text="ℹ️",
+            font=customtkinter.CTkFont(size=12),
+            text_color="gray70"
+        )
+        info_label.pack(side="right", padx=(10, 0))
+
+        # Bind tooltip
+        def show_info_tooltip(event):
+            # Create a simple tooltip
+            tooltip = customtkinter.CTkLabel(
+                checkbox_container,
+                text="When checked, the setup will create a new database\ninside your existing MariaDB installation without\naffecting your other databases.",
+                font=customtkinter.CTkFont(size=10),
+                fg_color="#2a2d2e",
+                corner_radius=6,
+                text_color="white"
+            )
+            tooltip.place(x=event.x + 20, y=event.y + 20)
+            tooltip.after(3000, tooltip.destroy)  # Auto-hide after 3 seconds
+
+        info_label.bind("<Enter>", show_info_tooltip)
+
+        # Existing DB configuration frame
+        self.existing_db_frame = customtkinter.CTkFrame(main_container)
+        self.existing_db_frame.grid(row=3, column=0, sticky="ew")
         self.existing_db_frame.grid_columnconfigure(1, weight=1)
-        customtkinter.CTkLabel(self.existing_db_frame, text="Root Password:").grid(row=0, column=0, sticky=tk.W, pady=5, padx=10)
-        customtkinter.CTkEntry(self.existing_db_frame, textvariable=self.db_root_password, show="*").grid(row=0, column=1, sticky="ew", pady=5, padx=5)
 
+        existing_title = customtkinter.CTkLabel(
+            self.existing_db_frame,
+            text="Existing Installation Settings",
+            font=customtkinter.CTkFont(size=12, weight="bold")
+        )
+        existing_title.grid(row=0, column=0, columnspan=2, sticky="w", padx=15, pady=(10, 8))
+
+        # Warning message
+        warning_frame = customtkinter.CTkFrame(self.existing_db_frame, fg_color="#2a2d2e", corner_radius=6)
+        warning_frame.grid(row=1, column=0, columnspan=2, sticky="ew", padx=15, pady=(0, 10))
+
+        warning_label = customtkinter.CTkLabel(
+            warning_frame,
+            text="⚠️ The setup will create a new database in your existing MariaDB installation.\nYour other databases will remain completely untouched.",
+            font=customtkinter.CTkFont(size=10),
+            text_color="#ffd966",
+            wraplength=400
+        )
+        warning_label.pack(pady=8, padx=8)
+
+        # Adjust the grid positions for the other elements
+        customtkinter.CTkLabel(self.existing_db_frame, text="Root Password:").grid(row=2, column=0, sticky="w", pady=6, padx=15)
+        customtkinter.CTkEntry(
+            self.existing_db_frame,
+            textvariable=self.db_root_password,
+            show="*",
+            placeholder_text="Existing root password"
+        ).grid(row=2, column=1, sticky="ew", pady=6, padx=5)
+
+        # MariaDB path frame
         self.mariadb_path_frame = customtkinter.CTkFrame(self.existing_db_frame)
-        self.mariadb_path_frame.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(5,0), padx=0)
+        self.mariadb_path_frame.grid(row=3, column=0, columnspan=2, sticky="ew", pady=(5, 10), padx=10)
         self.mariadb_path_frame.grid_columnconfigure(1, weight=1)
 
-        customtkinter.CTkLabel(self.mariadb_path_frame, text="MariaDB Path:").grid(row=0, column=0, sticky=tk.W, pady=5, padx=10)
-        customtkinter.CTkEntry(self.mariadb_path_frame, textvariable=self.mariadb_path, placeholder_text="Optional: Auto-detect if empty").grid(row=0, column=1, sticky="ew", pady=5, padx=5)
-        customtkinter.CTkButton(self.mariadb_path_frame, text="Browse...", command=self.browse_mariadb_directory, width=100).grid(row=0, column=2, pady=5, padx=5)
-        
+        customtkinter.CTkLabel(self.mariadb_path_frame, text="MariaDB Path:").grid(row=0, column=0, sticky="w", pady=6, padx=10)
+        customtkinter.CTkEntry(
+            self.mariadb_path_frame,
+            textvariable=self.mariadb_path,
+            placeholder_text="Optional: Auto-detect if empty"
+        ).grid(row=0, column=1, sticky="ew", pady=6, padx=5)
+        customtkinter.CTkButton(
+            self.mariadb_path_frame,
+            text="Browse...",
+            command=self.browse_mariadb_directory,
+            width=100
+        ).grid(row=0, column=2, pady=6, padx=5)
+
+        customtkinter.CTkLabel(self.existing_db_frame, text="Root Password:").grid(row=1, column=0, sticky="w", pady=6, padx=15)
+        customtkinter.CTkEntry(
+            self.existing_db_frame,
+            textvariable=self.db_root_password,
+            show="*",
+            placeholder_text="Existing root password"
+        ).grid(row=1, column=1, sticky="ew", pady=6, padx=5)
+
+        # MariaDB path frame
+        self.mariadb_path_frame = customtkinter.CTkFrame(self.existing_db_frame)
+        self.mariadb_path_frame.grid(row=2, column=0, columnspan=2, sticky="ew", pady=(5, 10), padx=10)
+        self.mariadb_path_frame.grid_columnconfigure(1, weight=1)
+
+        customtkinter.CTkLabel(self.mariadb_path_frame, text="MariaDB Path:").grid(row=0, column=0, sticky="w", pady=6, padx=10)
+        customtkinter.CTkEntry(
+            self.mariadb_path_frame,
+            textvariable=self.mariadb_path,
+            placeholder_text="Optional: Auto-detect if empty"
+        ).grid(row=0, column=1, sticky="ew", pady=6, padx=5)
+        customtkinter.CTkButton(
+            self.mariadb_path_frame,
+            text="Browse...",
+            command=self.browse_mariadb_directory,
+            width=100
+        ).grid(row=0, column=2, pady=6, padx=5)
+
         self.toggle_mariadb_fields()
 
     def setup_multi_server_tab(self, tab):
         tab.grid_rowconfigure(0, weight=1)
-        self.server_list_frame = customtkinter.CTkScrollableFrame(tab)
-        self.server_list_frame.grid(row=0, column=0, sticky="nsew", padx=10, pady=10)
+        tab.grid_columnconfigure(0, weight=1)
+
+        # Main container
+        main_container = customtkinter.CTkFrame(tab, fg_color="transparent")
+        main_container.grid(row=0, column=0, sticky="nsew", padx=15, pady=15)
+        main_container.grid_columnconfigure(0, weight=1)
+        main_container.grid_rowconfigure(0, weight=1)
+
+        # Header
+        header_label = customtkinter.CTkLabel(
+            main_container,
+            text="Multi-Server Configuration",
+            font=self.header_font
+        )
+        header_label.grid(row=0, column=0, sticky="w", pady=(0, 10))
+
+        # Scrollable frame for servers
+        self.server_list_frame = customtkinter.CTkScrollableFrame(
+            main_container,
+            fg_color="transparent"
+        )
+        self.server_list_frame.grid(row=1, column=0, sticky="nsew", pady=(0, 10))
         self.server_list_frame.grid_columnconfigure(0, weight=1)
-        
-        button_frame_multi = customtkinter.CTkFrame(tab, fg_color="transparent")
-        button_frame_multi.grid(row=1, column=0, sticky="e", pady=(0,10), padx=10)
-        add_server_button = customtkinter.CTkButton(button_frame_multi, text="+ Add Server", command=self.add_server_row, width=120)
+
+        # Info text
+        info_frame = customtkinter.CTkFrame(main_container, fg_color="transparent")
+        info_frame.grid(row=2, column=0, sticky="ew", pady=(0, 10))
+
+        info_text = customtkinter.CTkLabel(
+            info_frame,
+            text="Configure multiple server instances for load balancing and redundancy.",
+            font=customtkinter.CTkFont(size=10),
+            text_color="gray70",
+            wraplength=600
+        )
+        info_text.pack(pady=5, padx=5)
+
+        # Button frame
+        button_frame_multi = customtkinter.CTkFrame(main_container, fg_color="transparent")
+        button_frame_multi.grid(row=3, column=0, sticky="e", pady=(0, 5))
+
+        add_server_button = customtkinter.CTkButton(
+            button_frame_multi,
+            text="+ Add Server",
+            command=self.add_server_row,
+            width=140,
+            height=35
+        )
         add_server_button.pack()
 
     def setup_progress_tab(self, tab):
         tab.grid_rowconfigure(0, weight=1)
-        progress_frame = customtkinter.CTkFrame(tab)
-        progress_frame.grid(row=0, column=0, sticky="nsew", padx=10, pady=10)
+
+        # Main container
+        main_container = customtkinter.CTkFrame(tab, fg_color="transparent")
+        main_container.grid(row=0, column=0, sticky="nsew", padx=15, pady=15)
+        main_container.grid_columnconfigure(0, weight=1)
+        main_container.grid_rowconfigure(1, weight=1)
+
+        # Header
+        header_label = customtkinter.CTkLabel(
+            main_container,
+            text="Setup Progress",
+            font=self.header_font
+        )
+        header_label.grid(row=0, column=0, sticky="w", pady=(0, 10))
+
+        # Progress frame
+        progress_frame = customtkinter.CTkFrame(main_container)
+        progress_frame.grid(row=1, column=0, sticky="nsew")
         progress_frame.grid_columnconfigure(0, weight=1)
         progress_frame.grid_rowconfigure(0, weight=1)
-        self.log_text = customtkinter.CTkTextbox(progress_frame, font=("Consolas", 13))
-        self.log_text.grid(row=0, column=0, sticky="nsew")
-        self.progress_bar = customtkinter.CTkProgressBar(progress_frame, mode='indeterminate')
-        self.progress_bar.grid(row=1, column=0, sticky="ew", pady=(10, 0))
+
+        # Log text area with better styling
+        self.log_text = customtkinter.CTkTextbox(
+            progress_frame,
+            font=("Consolas", 11),
+            wrap="word"
+        )
+        self.log_text.grid(row=0, column=0, sticky="nsew", padx=10, pady=(10, 5))
+
+        # Progress bar with better styling
+        progress_container = customtkinter.CTkFrame(progress_frame, fg_color="transparent")
+        progress_container.grid(row=1, column=0, sticky="ew", padx=10, pady=(0, 10))
+        progress_container.grid_columnconfigure(0, weight=1)
+
+        progress_label = customtkinter.CTkLabel(
+            progress_container,
+            text="Progress:",
+            font=customtkinter.CTkFont(size=10)
+        )
+        progress_label.grid(row=0, column=0, sticky="w", pady=(0, 2))
+
+        self.progress_bar = customtkinter.CTkProgressBar(
+            progress_container,
+            mode='indeterminate',
+            height=8
+        )
+        self.progress_bar.grid(row=1, column=0, sticky="ew")
 
     def setup_tools_tab(self, tab):
-        tools_frame = customtkinter.CTkFrame(tab)
-        tools_frame.grid(row=0, column=0, sticky="new", padx=10, pady=10)
-        tools_frame.grid_columnconfigure(0, weight=1)
+        tab.grid_columnconfigure(0, weight=1)
+        tab.grid_rowconfigure(0, weight=1)
 
-        self.update_button = customtkinter.CTkButton(tools_frame, text="Check for Updates & Recompile", command=self.check_for_updates)
-        self.update_button.grid(row=0, column=0, padx=5, pady=5, sticky="ew")
-        command_editor_button = customtkinter.CTkButton(tools_frame, text="Command Permissions Editor", command=self.open_command_editor)
-        command_editor_button.grid(row=1, column=0, padx=5, pady=5, sticky="ew")
-        
-        cache_frame = customtkinter.CTkFrame(tab)
-        cache_frame.grid(row=1, column=0, sticky="new", padx=10, pady=10)
+        # Main container
+        main_container = customtkinter.CTkFrame(tab, fg_color="transparent")
+        main_container.grid(row=0, column=0, sticky="nsew", padx=15, pady=15)
+        main_container.grid_columnconfigure(0, weight=1)
+
+        # Header
+        header_label = customtkinter.CTkLabel(
+            main_container,
+            text="Tools & Updates",
+            font=self.header_font
+        )
+        header_label.grid(row=0, column=0, sticky="w", pady=(0, 15))
+
+        # Update tools frame
+        update_frame = customtkinter.CTkFrame(main_container)
+        update_frame.grid(row=1, column=0, sticky="ew", pady=(0, 15))
+        update_frame.grid_columnconfigure(0, weight=1)
+
+        update_title = customtkinter.CTkLabel(
+            update_frame,
+            text="Update & Build Tools",
+            font=customtkinter.CTkFont(size=12, weight="bold")
+        )
+        update_title.grid(row=0, column=0, sticky="w", padx=15, pady=(10, 8))
+
+        self.update_button = customtkinter.CTkButton(
+            update_frame,
+            text="Check for Updates & Recompile",
+            command=self.check_for_updates,
+            height=40
+        )
+        self.update_button.grid(row=1, column=0, padx=15, pady=(0, 10), sticky="ew")
+
+        # Command editor frame
+        command_frame = customtkinter.CTkFrame(main_container)
+        command_frame.grid(row=2, column=0, sticky="ew", pady=(0, 15))
+        command_frame.grid_columnconfigure(0, weight=1)
+
+        command_title = customtkinter.CTkLabel(
+            command_frame,
+            text="Configuration Tools",
+            font=customtkinter.CTkFont(size=12, weight="bold")
+        )
+        command_title.grid(row=0, column=0, sticky="w", padx=15, pady=(10, 8))
+
+        command_editor_button = customtkinter.CTkButton(
+            command_frame,
+            text="Command Permissions Editor",
+            command=self.open_command_editor,
+            height=40
+        )
+        command_editor_button.grid(row=1, column=0, padx=15, pady=(0, 10), sticky="ew")
+
+        # Cache management frame
+        cache_frame = customtkinter.CTkFrame(main_container)
+        cache_frame.grid(row=3, column=0, sticky="ew")
         cache_frame.grid_columnconfigure(0, weight=1)
-        customtkinter.CTkButton(cache_frame, text="Clear Cache & Restart", command=self.clear_cache_and_restart, fg_color="#D32F2F", hover_color="#B71C1C").grid(row=0, column=0, padx=5, pady=5, sticky="ew")
-        
+
+        cache_title = customtkinter.CTkLabel(
+            cache_frame,
+            text="Maintenance",
+            font=customtkinter.CTkFont(size=12, weight="bold")
+        )
+        cache_title.grid(row=0, column=0, sticky="w", padx=15, pady=(10, 8))
+
+        customtkinter.CTkButton(
+            cache_frame,
+            text="Clear Cache & Restart",
+            command=self.clear_cache_and_restart,
+            fg_color="#D32F2F",
+            hover_color="#B71C1C",
+            height=40
+        ).grid(row=1, column=0, padx=15, pady=(0, 15), sticky="ew")
+
         self.setup_running = False
         self.update_all_consoles()
 
@@ -629,35 +1140,88 @@ class MicroVoltsServerSetup(customtkinter.CTk):
         console_tab.grid_columnconfigure(0, weight=1)
         console_tab.grid_rowconfigure(1, weight=1)
 
-        controls_frame = customtkinter.CTkFrame(console_tab, fg_color="transparent")
-        controls_frame.grid(row=0, column=0, sticky="ew", pady=(10, 10), padx=10)
+        # Main container
+        main_container = customtkinter.CTkFrame(console_tab, fg_color="transparent")
+        main_container.grid(row=0, column=0, sticky="nsew", padx=15, pady=15)
+        main_container.grid_columnconfigure(0, weight=1)
+        main_container.grid_rowconfigure(1, weight=1)
+
+        # Header
+        header_label = customtkinter.CTkLabel(
+            main_container,
+            text="Server Console",
+            font=self.header_font
+        )
+        header_label.grid(row=0, column=0, sticky="w", pady=(0, 10))
+
+        # Controls frame
+        controls_frame = customtkinter.CTkFrame(main_container)
+        controls_frame.grid(row=1, column=0, sticky="ew", pady=(0, 10))
         controls_frame.grid_columnconfigure(1, weight=1)
-        
+
+        # Action buttons
         action_frame = customtkinter.CTkFrame(controls_frame, fg_color="transparent")
-        action_frame.pack(side="left")
+        action_frame.grid(row=0, column=0, sticky="w", padx=10, pady=10)
 
-        customtkinter.CTkButton(action_frame, text="Start All Servers", command=self.start_all_servers).pack(side="left", padx=(0, 5))
-        customtkinter.CTkButton(action_frame, text="Stop All Servers", command=self.stop_all_servers, fg_color="#D32F2F", hover_color="#B71C1C").pack(side="left")
+        customtkinter.CTkButton(
+            action_frame,
+            text="Start All Servers",
+            command=self.start_all_servers,
+            height=35,
+            width=140
+        ).pack(side="left", padx=(0, 8))
 
+        customtkinter.CTkButton(
+            action_frame,
+            text="Stop All Servers",
+            command=self.stop_all_servers,
+            fg_color="#D32F2F",
+            hover_color="#B71C1C",
+            height=35,
+            width=140
+        ).pack(side="left")
+
+        # Status indicators
         status_frame = customtkinter.CTkFrame(controls_frame)
-        status_frame.pack(side="right", padx=(10, 0))
+        status_frame.grid(row=0, column=1, sticky="e", padx=10, pady=10)
         self.server_status_frame = status_frame
 
-        console_frame = customtkinter.CTkFrame(console_tab)
-        console_frame.grid(row=1, column=0, columnspan=2, sticky="nsew", padx=10, pady=(0,10))
+        # Console frame
+        console_frame = customtkinter.CTkFrame(main_container)
+        console_frame.grid(row=2, column=0, sticky="nsew")
         console_frame.grid_columnconfigure(0, weight=1)
         console_frame.grid_rowconfigure(1, weight=1)
 
+        # Server selector
         selector_frame = customtkinter.CTkFrame(console_frame, fg_color="transparent")
-        selector_frame.grid(row=0, column=0, sticky="ew", pady=(0,5))
-        
-        customtkinter.CTkLabel(selector_frame, text="Show output for:").pack(side="left")
-        self.console_server_selector = customtkinter.CTkComboBox(selector_frame, variable=self.console_server_selection, state="readonly", width=200, command=self.on_server_select)
-        self.console_server_selector.pack(side="left", padx=5)
+        selector_frame.grid(row=0, column=0, sticky="ew", pady=(10, 5), padx=10)
 
-        self.console_text = customtkinter.CTkTextbox(console_frame, state='disabled', font=("Consolas", 14))
-        self.console_text.grid(row=1, column=0, sticky="nsew")
-        
+        customtkinter.CTkLabel(
+            selector_frame,
+            text="Show output for:",
+            font=customtkinter.CTkFont(size=11)
+        ).pack(side="left")
+
+        self.console_server_selector = customtkinter.CTkComboBox(
+            selector_frame,
+            variable=self.console_server_selection,
+            state="readonly",
+            width=200,
+            height=30,
+            command=self.on_server_select
+        )
+        self.console_server_selector.pack(side="left", padx=(8, 0))
+
+        # Console text area
+        self.console_text = customtkinter.CTkTextbox(
+            console_frame,
+            state='disabled',
+            font=("Consolas", 11),
+            wrap="word"
+        )
+        self.console_text.grid(row=1, column=0, sticky="nsew", padx=10, pady=(0, 10))
+
+        # Configure text tags for colored output
         self.console_text.tag_config("ERROR", foreground="#ff8787")
         self.console_text.tag_config("WARN", foreground="#ffd966")
         self.console_text.tag_config("INFO", foreground="#82c0ff")
@@ -879,7 +1443,7 @@ class MicroVoltsServerSetup(customtkinter.CTk):
 
     def toggle_mariadb_fields(self):
         if self.existing_mariadb.get():
-            self.existing_db_frame.grid(row=2, column=0, columnspan=4, sticky="ew", pady=10, padx=5)
+            self.existing_db_frame.grid(row=3, column=0, sticky="ew", pady=(0, 10))
             self.db_install_frame.grid_remove()
         else:
             self.existing_db_frame.grid_remove()
@@ -1008,7 +1572,7 @@ class MicroVoltsServerSetup(customtkinter.CTk):
         self.setup_steps = [
             ("prerequisites", self.check_prerequisites, False),
             ("install_type", self.ask_for_install_type, False),
-            ("install_llvm", worker_install_llvm, True),
+            ("install_llvm", worker_install_llvm_crossplatform, True),
             ("download_repo", worker_download_repository, True),
             ("extract_cleanup", self.extract_and_cleanup, False),
             ("setup_vcpkg", worker_setup_vcpkg, True),
@@ -1134,7 +1698,7 @@ class MicroVoltsServerSetup(customtkinter.CTk):
 
     def check_prerequisites(self):
         self.log("Checking prerequisites...")
-        
+
         try:
             result = subprocess.run(['git', '--version'], capture_output=True, text=True)
             if result.returncode == 0:
@@ -1175,7 +1739,12 @@ class MicroVoltsServerSetup(customtkinter.CTk):
             self.log("7-Zip is not installed or could not be found.")
             messagebox.showerror("Prerequisite Missing", "7-Zip is not installed or could not be found in your PATH.\nPlease install version 24.09 or newer and ensure it's in your system's PATH.")
             return False
-            
+
+        # Log system info for portability
+        self.log(f"Operating System: {os.name}")
+        self.log(f"Python executable: {sys.executable}")
+        self.log(f"Current working directory: {os.getcwd()}")
+
         return True
 
     def is_vs_installed(self):
@@ -1340,6 +1909,13 @@ class MicroVoltsServerSetup(customtkinter.CTk):
         self.progress_bar.stop()
 
     def find_vcvarsall(self):
+        import platform
+        system = platform.system().lower()
+
+        if system != "windows":
+            self.log(f"vcvarsall.bat not applicable on {system}.")
+            return None
+
         self.log("Finding vcvarsall.bat...")
         try:
             vswhere_path = None
@@ -1351,7 +1927,7 @@ class MicroVoltsServerSetup(customtkinter.CTk):
                 if os.path.exists(path):
                     vswhere_path = path
                     break
-            
+
             if not vswhere_path:
                 self.log("vswhere.exe not found.")
                 return None
@@ -1359,7 +1935,7 @@ class MicroVoltsServerSetup(customtkinter.CTk):
             cmd = [vswhere_path, "-latest", "-property", "installationPath"]
             result = subprocess.run(cmd, capture_output=True, text=True, check=True)
             vs_path = result.stdout.strip()
-            
+
             if not vs_path:
                 self.log("Visual Studio installation path not found.")
                 return None
@@ -1376,6 +1952,13 @@ class MicroVoltsServerSetup(customtkinter.CTk):
             return None
 
     def find_msbuild(self):
+        import platform
+        system = platform.system().lower()
+
+        if system != "windows":
+            self.log(f"MSBuild.exe not applicable on {system}.")
+            return None
+
         self.log("Finding MSBuild.exe...")
         try:
             vswhere_path = None
@@ -1387,7 +1970,7 @@ class MicroVoltsServerSetup(customtkinter.CTk):
                 if os.path.exists(path):
                     vswhere_path = path
                     break
-            
+
             if not vswhere_path:
                 self.log("vswhere.exe not found.")
                 return None
@@ -1520,31 +2103,74 @@ class MicroVoltsServerSetup(customtkinter.CTk):
             repo_path = os.path.join(self.project_path.get(), "MicrovoltsEmulator")
             setup_dir = os.path.join(repo_path, "Setup")
             os.makedirs(setup_dir, exist_ok=True)
-            
+
             config_path = os.path.join(setup_dir, "config.ini")
-            
+
             config = configparser.ConfigParser()
             config.optionxform = str
-            
-            local_ip = self.local_ip.get() if self.local_ip.get() else "127.0.0.1"
 
-            config['Database'] = {
-                'Ip': self.db_ip.get(),
-                'Port': self.db_port.get(),
-                'DatabaseName': self.db_name.get(),
-                'Username': self.db_username.get(),
-                'PasswordEnvironmentName': 'MICROVOLTS_DB_PASSWORD'
-            }
-            
+            # Read existing config file if it exists to preserve other sections
+            if os.path.exists(config_path):
+                self.log(f"Reading existing config file: {config_path}")
+                config.read(config_path)
+                self.log("Existing configuration sections preserved.")
+            else:
+                self.log(f"Creating new config file: {config_path}")
+
+            # Get local IP
+            local_ip = self.local_ip.get() if self.local_ip.get() else "127.0.0.1"
+            self.log(f"Using local IP: {local_ip}")
+
+            # Get public IP (use local IP as default if not specified differently)
+            public_ip = local_ip  # Default to local IP, can be overridden by user input
+
+            # Update server sections with auto-detected IPs
+            if 'AuthServer' not in config:
+                config.add_section('AuthServer')
+            config.set('AuthServer', 'LocalIp', local_ip)
+            config.set('AuthServer', 'Ip', public_ip)
+            config.set('AuthServer', 'Port', '13000')
+
+            if 'MainServer_1' not in config:
+                config.add_section('MainServer_1')
+            config.set('MainServer_1', 'LocalIp', local_ip)
+            config.set('MainServer_1', 'Ip', public_ip)
+            config.set('MainServer_1', 'Port', '13005')
+            config.set('MainServer_1', 'IpcPort', '14005')
+            config.set('MainServer_1', 'IsPublic', 'true')
+
+            if 'CastServer_1' not in config:
+                config.add_section('CastServer_1')
+            config.set('CastServer_1', 'LocalIp', local_ip)
+            config.set('CastServer_1', 'Ip', public_ip)
+            config.set('CastServer_1', 'Port', '13006')
+            config.set('CastServer_1', 'IpcPort', '14006')
+
+            # Update Database section
+            if 'Database' not in config:
+                config.add_section('Database')
+            config.set('Database', 'Ip', self.db_ip.get())
+            config.set('Database', 'Port', self.db_port.get())
+            config.set('Database', 'DatabaseName', self.db_name.get())
+            config.set('Database', 'Username', self.db_username.get())
+            config.set('Database', 'PasswordEnvironmentName', 'MICROVOLTS_DB_PASSWORD')
+
+            # Update Website section if it exists
+            if 'Website' in config:
+                config.set('Website', 'Ip', local_ip)
+                config.set('Website', 'Port', '8080')
+
             with open(config_path, 'w') as configfile:
                 config.write(configfile)
-                
-            self.log(f"Configuration file created: {config_path}")
-            
+
+            self.log(f"Configuration file updated: {config_path}")
+            self.log(f"Server IPs auto-configured - Local: {local_ip}, Public: {public_ip}")
+            self.log(f"Database section configured with IP: {self.db_ip.get()}, Port: {self.db_port.get()}, DB: {self.db_name.get()}")
+
             db_password = self.db_password.get()
             os.environ['MICROVOLTS_DB_PASSWORD'] = db_password
             self.log("Database password set as environment variable for this session.")
-            
+
             return True
         except Exception as e:
             self.log(f"Failed to setup configuration: {str(e)}")
